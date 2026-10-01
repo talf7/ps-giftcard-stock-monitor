@@ -93,9 +93,20 @@ def parse_status(html: str) -> Status:
     return Status.UNKNOWN
 
 
+# Only look for the price inside the product's own buy box; elsewhere on the
+# page prices belong to recommended/sponsored products.
+PRICE_BLOCK_IDS = ('id="corePriceDisplay_desktop_feature_div"', 'id="corePrice_feature_div"',
+                   'id="corePrice_desktop"', 'id="apex_desktop"')
+
+
 def parse_price(html: str) -> str | None:
-    m = PRICE_RE.search(html)
-    return m.group(1) if m else None
+    for block_id in PRICE_BLOCK_IDS:
+        start = html.find(block_id)
+        if start != -1:
+            m = PRICE_RE.search(html, start, start + 5000)
+            if m:
+                return m.group(1)
+    return None
 
 
 def fetch(session: requests.Session, product: Product) -> tuple[Status, str | None]:

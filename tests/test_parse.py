@@ -26,8 +26,15 @@ def test_unknown():
 
 
 def test_price():
-    assert parse_price('<span class="a-price-whole">2,699<span>') == "2,699"
+    html = '<div id="corePriceDisplay_desktop_feature_div"><span class="a-price-whole">2,699<span></div>'
+    assert parse_price(html) == "2,699"
     assert parse_price("<html></html>") is None
+
+
+def test_price_ignores_recommendations():
+    # Out-of-stock page: no buy-box price, only a carousel item's price
+    html = '<div id="outOfStock">Currently unavailable</div><div class="carousel"><span class="a-price-whole">5,999</span></div>'
+    assert parse_price(html) is None
 
 
 def test_load_products(tmp_path):
