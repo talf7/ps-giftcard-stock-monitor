@@ -57,9 +57,9 @@ cp .env.example .env   # ומלא את הערכים
 python monitor.py
 ```
 
-## GitHub Actions (אופציונלי)
+## GitHub Actions (אופציונלי, ידני בלבד)
 
-ה-workflow קורא את `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` מה-Secrets. ריצה מתוזמנת רציפה דורשת repo ציבורי (~43,000 דקות בחודש); ב-repo פרטי הריצה המתוזמנת מדלגת ורק הפעלה ידנית עובדת. אם המחשב רץ — אין צורך בזה.
+ה-workflow רץ רק בהפעלה ידנית (Actions → Stock monitor → Run workflow). **לא להריץ במקביל למחשב** — שני עותקים מכפילים את העומס על אמאזון (וה-IP של GitHub נחסם מהר) ושוברים את כפתורי הטלגרם.
 
 ## בדיקות
 

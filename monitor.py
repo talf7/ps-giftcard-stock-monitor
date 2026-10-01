@@ -362,12 +362,32 @@ def handle_callback(query: dict, products: dict[str, Product]) -> None:
 def poll_telegram(products: dict[str, Product]) -> None:
     """Background loop that receives button taps (long polling)."""
     offset = None
+    conflict_since = None
     while True:
-        result = telegram_api("getUpdates", {"timeout": 30, "offset": offset,
-                                             "allowed_updates": ["callback_query"]}, timeout=40)
-        if result is None:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                              json={"timeout": 30, "offset": offset,
+                                    "allowed_updates": ["callback_query"]}, timeout=40)
+        except requests.RequestException:
+            time.sleep(5)  # network hiccup; long polling simply resumes
+            continue
+        if r.status_code == 409:
+            # Another program is polling this bot - almost always a second copy
+            # of the monitor (another window, or GitHub Actions).
+            if conflict_since is None:
+                conflict_since = time.monotonic()
+                log("WARNING: another copy of this monitor is running with the same Telegram bot "
+                    "(another window or GitHub Actions?). Close it - duplicates double the load on "
+                    "Amazon and the Mute buttons won't work reliably.")
+            time.sleep(30)
+            continue
+        if conflict_since is not None:
+            log("The other monitor copy stopped - Telegram buttons work again")
+            conflict_since = None
+        if not r.ok:
             time.sleep(5)
             continue
+        result = r.json()
         for update in result.get("result", []):
             offset = update["update_id"] + 1
             if "callback_query" in update:
