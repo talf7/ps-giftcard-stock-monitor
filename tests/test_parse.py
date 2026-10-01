@@ -55,22 +55,24 @@ def test_bundled_products_file():
 
 def test_alerts(monkeypatch):
     sent = []
-    monkeypatch.setattr(monitor, "send_telegram", lambda t: sent.append(t) or True)
+    monkeypatch.setattr(monitor, "send_telegram", lambda t, b=None: sent.append((t, b)) or True)
     p = Product("B093QF35KZ", "Rs.2000")
     monitor.handle_result(p, Status.OUT_OF_STOCK, None, 0)
     assert sent == []
     monitor.handle_result(p, Status.IN_STOCK, "2,000", 1)
-    assert len(sent) == 1 and "IN STOCK" in sent[0] and "cart/add" in sent[0]
+    assert len(sent) == 1 and "IN STOCK" in sent[0][0]
+    assert sent[0][1][0][0]["url"].endswith("ASIN.1=B093QF35KZ&Quantity.1=1")
+    assert sent[0][1][1][0]["callback_data"] == "mute:B093QF35KZ"
     monitor.handle_result(p, Status.IN_STOCK, "2,000", 2)  # no spam within REMIND_EVERY
     assert len(sent) == 1
     monitor.handle_result(p, Status.IN_STOCK, "2,000", 2 + monitor.REMIND_EVERY)
     assert len(sent) == 2
     monitor.handle_result(p, Status.OUT_OF_STOCK, None, 200)
-    assert "Out of stock" in sent[-1]
+    assert "Out of stock" in sent[-1][0]
 
 
 def test_failed_send_retries(monkeypatch):
-    monkeypatch.setattr(monitor, "send_telegram", lambda t: False)
+    monkeypatch.setattr(monitor, "send_telegram", lambda t, b=None: False)
     p = Product("X", "X")
     monitor.handle_result(p, Status.IN_STOCK, None, 5)
     assert p.last_alert == 0.0  # will retry on next check
@@ -159,3 +161,47 @@ def test_ignored_seller_is_not_alerted(monkeypatch, tmp_path):
     other = html.replace("Express Games", "Appario Retail")
     assert monitor.fetch(FakeSession(FakeResp(200, other)), p)[0] is Status.IN_STOCK
     assert p.seller == "Appario Retail"
+
+
+def test_mute_until_next_restock(monkeypatch):
+    sent, calls = [], []
+    monkeypatch.setattr(monitor, "send_telegram", lambda t, b=None: sent.append(t) or True)
+    monkeypatch.setattr(monitor, "telegram_api", lambda m, p, timeout=10: calls.append((m, p)) or {})
+    monkeypatch.setattr(monitor, "log", lambda m: None)
+    monkeypatch.setattr(monitor, "TELEGRAM_CHAT_ID", "42")
+    p = Product("B07K6RYVJ5", "Rs.4000")
+    products = {p.asin: p}
+    monitor.handle_result(p, Status.IN_STOCK, None, 0)
+    assert len(sent) == 1
+
+    # taps from another chat are ignored
+    query = {"id": "q1", "data": "mute:B07K6RYVJ5", "message": {"chat": {"id": 7}, "message_id": 5}}
+    monitor.handle_callback(query, products)
+    assert not p.muted and calls == []
+
+    query["message"]["chat"]["id"] = 42
+    monitor.handle_callback(query, products)
+    assert p.muted
+    assert calls[0][0] == "answerCallbackQuery"
+    assert calls[1][0] == "editMessageReplyMarkup"
+    assert calls[1][1]["reply_markup"]["inline_keyboard"][1][0]["callback_data"] == "unmute:B07K6RYVJ5"
+
+    # still "in stock" on the page, but muted: no reminders
+    monitor.handle_result(p, Status.IN_STOCK, None, 10_000)
+    assert len(sent) == 1
+
+    # goes out of stock -> unmuted, next restock alerts again
+    monitor.handle_result(p, Status.OUT_OF_STOCK, None, 10_001)
+    assert not p.muted and "back on" in sent[-1]
+    monitor.handle_result(p, Status.IN_STOCK, None, 10_002)
+    assert "IN STOCK" in sent[-1]
+
+
+def test_unmute_button(monkeypatch):
+    monkeypatch.setattr(monitor, "telegram_api", lambda m, p, timeout=10: {})
+    monkeypatch.setattr(monitor, "log", lambda m: None)
+    monkeypatch.setattr(monitor, "TELEGRAM_CHAT_ID", "42")
+    p = Product("X", "X", muted=True)
+    monitor.handle_callback({"id": "q", "data": "unmute:X",
+                             "message": {"chat": {"id": 42}, "message_id": 1}}, {"X": p})
+    assert not p.muted

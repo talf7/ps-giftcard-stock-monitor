@@ -7,6 +7,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -38,7 +39,7 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(HERE / ".env")
 
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "2"))  # seconds between requests
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "1.5"))  # seconds between request starts
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "300"))  # re-alert while in stock (s)
 BLOCK_ALERT_AFTER = float(os.getenv("BLOCK_ALERT_AFTER", "600"))  # warn if blocked this long (s)
@@ -75,6 +76,7 @@ class Product:
     last_alert: float = 0.0
     last_problem: str | None = None
     seller: str | None = None
+    muted: bool = False  # muted from Telegram until the product goes out of stock
 
     @property
     def url(self) -> str:
@@ -278,22 +280,78 @@ def fetch(session, product: Product) -> tuple[Status, str | None]:
     return status, parse_price(resp.text)
 
 
-def send_telegram(text: str) -> bool:
+def telegram_api(method: str, payload: dict, timeout: float = 10):
+    """Call a Telegram Bot API method; returns the parsed JSON, or None on failure."""
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+                          json=payload, timeout=timeout)
+        if not r.ok:
+            print(f"Telegram error {r.status_code}: {r.text}", flush=True)
+            return None
+        return r.json()
+    except requests.RequestException as e:
+        print(f"Telegram request failed: {e}", flush=True)
+        return None
+
+
+def send_telegram(text: str, buttons: list | None = None) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[telegram not configured] {text}", flush=True)
         return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            timeout=10,
-        )
-        if not r.ok:
-            print(f"Telegram error {r.status_code}: {r.text}", flush=True)
-        return r.ok
-    except requests.RequestException as e:
-        print(f"Telegram request failed: {e}", flush=True)
-        return False
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": buttons}
+    return telegram_api("sendMessage", payload) is not None
+
+
+def alert_buttons(product: Product) -> list:
+    action = (f"🔔 Unmute", f"unmute:{product.asin}") if product.muted else \
+             (f"🔕 Mute until next restock", f"mute:{product.asin}")
+    return [
+        [{"text": "🛒 Add to cart", "url": product.cart_url}],
+        [{"text": action[0], "callback_data": action[1]}],
+    ]
+
+
+def handle_callback(query: dict, products: dict[str, Product]) -> None:
+    """React to a tap on an alert's Mute/Unmute button."""
+    message = query.get("message") or {}
+    if str(message.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+        return
+    action, _, asin = (query.get("data") or "").partition(":")
+    product = products.get(asin)
+    if product is None or action not in ("mute", "unmute"):
+        telegram_api("answerCallbackQuery", {"callback_query_id": query["id"]})
+        return
+    product.muted = action == "mute"
+    if product.muted:
+        note = f"🔕 Muted {product.label} until it goes out of stock and comes back"
+    else:
+        note = f"🔔 Alerts for {product.label} are back on"
+    log(note)
+    telegram_api("answerCallbackQuery", {"callback_query_id": query["id"], "text": note})
+    telegram_api("editMessageReplyMarkup", {
+        "chat_id": message["chat"]["id"], "message_id": message["message_id"],
+        "reply_markup": {"inline_keyboard": alert_buttons(product)},
+    })
+
+
+def poll_telegram(products: dict[str, Product]) -> None:
+    """Background loop that receives button taps (long polling)."""
+    offset = None
+    while True:
+        result = telegram_api("getUpdates", {"timeout": 30, "offset": offset,
+                                             "allowed_updates": ["callback_query"]}, timeout=40)
+        if result is None:
+            time.sleep(5)
+            continue
+        for update in result.get("result", []):
+            offset = update["update_id"] + 1
+            if "callback_query" in update:
+                try:
+                    handle_callback(update["callback_query"], products)
+                except Exception as e:
+                    log(f"Button handling failed: {e}")
 
 
 def log(msg: str) -> None:
@@ -312,17 +370,21 @@ def keep_awake() -> None:
 def handle_result(product: Product, status: Status, price: str | None, now: float) -> None:
     price_txt = f" — ₹{price}" if price else ""
     if status is Status.IN_STOCK:
-        if product.status is not Status.IN_STOCK or now - product.last_alert >= REMIND_EVERY:
+        due = product.status is not Status.IN_STOCK or now - product.last_alert >= REMIND_EVERY
+        if due and not product.muted:
             seller_txt = f"\n🏪 Seller: {product.seller}" if product.seller else ""
             sent = send_telegram(
                 f"🟢 IN STOCK: {product.label}{price_txt}{seller_txt}\n\n"
-                f"🛒 Add to cart: {product.cart_url}\n"
-                f"📄 Page: {product.url}"
+                f"📄 Page: {product.url}",
+                alert_buttons(product),
             )
             if sent:
                 product.last_alert = now
     elif status is Status.OUT_OF_STOCK and product.status is Status.IN_STOCK:
-        send_telegram(f"🔴 Out of stock again: {product.label}\n{product.url}")
+        was_muted, product.muted = product.muted, False
+        send_telegram(f"🔴 Out of stock again: {product.label}"
+                      + ("\n🔔 Alerts are back on for the next restock" if was_muted else "")
+                      + f"\n{product.url}")
 
     if status is not product.status and status is not Status.UNKNOWN:
         log(f"{product.label}: {status.value}{price_txt}")
@@ -335,6 +397,9 @@ def main() -> int:
         log(f"No products in {PRODUCTS_FILE}")
         return 1
     keep_awake()
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        threading.Thread(target=poll_telegram, args=({p.asin: p for p in products},),
+                         daemon=True).start()
     session = new_session()
     start = round_start = time.monotonic()
     rounds = blocks = errors = 0
@@ -355,6 +420,7 @@ def main() -> int:
             log("Max runtime reached, exiting")
             return 0
         product = products[i % len(products)]
+        request_start = time.monotonic()
         try:
             status, price = fetch(session, product)
         except Exception as e:
@@ -393,7 +459,8 @@ def main() -> int:
 
         if i % len(products) == 0:
             rounds += 1
-            in_stock = [p.label for p in products if p.status is Status.IN_STOCK]
+            in_stock = [p.label + (" (muted)" if p.muted else "")
+                        for p in products if p.status is Status.IN_STOCK]
             unknown = sum(p.status is None for p in products)
             summary = f"IN STOCK: {', '.join(in_stock)}" if in_stock else "all out of stock"
             if unknown:
@@ -404,7 +471,9 @@ def main() -> int:
             round_start = now
             blocks = errors = 0
 
-        time.sleep(INTERVAL + random.uniform(0, INTERVAL * 0.3))
+        # Pace from the start of the request, so slow responses don't add extra delay
+        elapsed = time.monotonic() - request_start
+        time.sleep(max(0.0, INTERVAL - elapsed) + random.uniform(0, 0.4))
 
 
 if __name__ == "__main__":
