@@ -402,12 +402,21 @@ def log(msg: str) -> None:
 
 
 def keep_awake() -> None:
-    """On Windows, stop the PC from sleeping while the monitor runs."""
+    """On Windows, stop the PC from sleeping and the console from pausing."""
     if sys.platform == "win32":
         import ctypes
 
         ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+        # A click in the console window starts "Select" (QuickEdit) mode, which
+        # freezes the program until Esc is pressed. Turn QuickEdit off.
+        kernel32 = ctypes.windll.kernel32
+        stdin = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(stdin, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            kernel32.SetConsoleMode(stdin, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
 
 
 def handle_result(product: Product, status: Status, price: str | None, now: float) -> None:
