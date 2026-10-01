@@ -40,11 +40,13 @@ load_dotenv(HERE / ".env")
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
 INTERVAL = float(os.getenv("CHECK_INTERVAL", "2"))  # seconds between requests
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
-REMIND_EVERY = float(os.getenv("REMIND_EVERY", "60"))  # re-alert while in stock (s)
+REMIND_EVERY = float(os.getenv("REMIND_EVERY", "300"))  # re-alert while in stock (s)
 BLOCK_ALERT_AFTER = float(os.getenv("BLOCK_ALERT_AFTER", "600"))  # warn if blocked this long (s)
 MAX_BACKOFF = 120
 # Amazon shows stock for a delivery location; without an Indian pincode it may hide offers
 DELIVERY_PINCODE = os.getenv("DELIVERY_PINCODE", "400001")  # Mumbai
+# Sellers whose "in stock" offers are ignored, e.g. listings that fail at checkout
+IGNORE_SELLERS = [x.strip().lower() for x in os.getenv("IGNORE_SELLERS", "").split(",") if x.strip()]
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -72,6 +74,7 @@ class Product:
     status: Status | None = None
     last_alert: float = 0.0
     last_problem: str | None = None
+    seller: str | None = None
 
     @property
     def url(self) -> str:
@@ -96,13 +99,32 @@ def load_products(path: Path) -> list[Product]:
 TAG_RE = re.compile(r"<[^>]+>")
 
 
-def section_text(html: str, element_id: str, length: int = 3000) -> str | None:
-    """Visible text right after the element with this id (lowercased), or None."""
+def section_text(html: str, element_id: str, length: int = 3000, lower: bool = True) -> str | None:
+    """Visible text right after the element with this id, or None."""
     start = html.find(f'id="{element_id}"')
     if start == -1:
         return None
     start = html.find(">", start) + 1
-    return " ".join(TAG_RE.sub(" ", html[start:start + length]).split()).lower()
+    text = " ".join(TAG_RE.sub(" ", html[start:start + length]).split())
+    return text.lower() if lower else text
+
+
+SELLER_RE = re.compile(r'id="sellerProfileTriggerId"[^>]*>([^<]+)<')
+
+
+def parse_seller(html: str) -> str | None:
+    m = SELLER_RE.search(html)
+    if m:
+        return " ".join(m.group(1).split()) or None
+    text = section_text(html, "merchantInfoFeature_feature_div", 600, lower=False)
+    if text:
+        text = re.sub(r"^(sold by|seller)\s*", "", text, flags=re.I)
+        return text[:50] or None
+    return None
+
+
+def is_ignored_seller(seller: str | None) -> bool:
+    return bool(seller) and any(name in seller.lower() for name in IGNORE_SELLERS)
 
 
 def parse_status(html: str) -> Status:
@@ -247,6 +269,12 @@ def fetch(session, product: Product) -> tuple[Status, str | None]:
         last_location = location
     status = parse_status(resp.text)
     report_problem(product, "page not recognized, see debug folder" if status is Status.UNKNOWN else None)
+    seller = parse_seller(resp.text) if status is Status.IN_STOCK else None
+    if is_ignored_seller(seller):
+        if product.seller != seller:
+            log(f"{product.label}: only offered by ignored seller {seller} - not alerting")
+        status = Status.OUT_OF_STOCK
+    product.seller = seller
     return status, parse_price(resp.text)
 
 
@@ -285,8 +313,9 @@ def handle_result(product: Product, status: Status, price: str | None, now: floa
     price_txt = f" — ₹{price}" if price else ""
     if status is Status.IN_STOCK:
         if product.status is not Status.IN_STOCK or now - product.last_alert >= REMIND_EVERY:
+            seller_txt = f"\n🏪 Seller: {product.seller}" if product.seller else ""
             sent = send_telegram(
-                f"🟢 IN STOCK: {product.label}{price_txt}\n\n"
+                f"🟢 IN STOCK: {product.label}{price_txt}{seller_txt}\n\n"
                 f"🛒 Add to cart: {product.cart_url}\n"
                 f"📄 Page: {product.url}"
             )

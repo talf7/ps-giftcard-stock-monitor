@@ -140,3 +140,22 @@ def test_find_csrf():
     assert monitor.find_csrf('data-a-modal="{&quot;anti-csrftoken-a2z&quot;:&quot;abc123&quot;}"') == "abc123"
     assert monitor.find_csrf('CSRF_TOKEN : "xyz",') == "xyz"
     assert monitor.find_csrf("nothing") is None
+
+
+def test_parse_seller():
+    assert monitor.parse_seller('<a id="sellerProfileTriggerId" href="#">Express Games</a>') == "Express Games"
+    html = '<div id="merchantInfoFeature_feature_div"><span>Sold by</span> <span>Amazon</span></div>'
+    assert monitor.parse_seller(html).startswith("Amazon")
+    assert monitor.parse_seller("<html></html>") is None
+
+
+def test_ignored_seller_is_not_alerted(monkeypatch, tmp_path):
+    monkeypatch.setattr(monitor, "DEBUG_DIR", tmp_path)
+    monkeypatch.setattr(monitor, "IGNORE_SELLERS", ["express games"])
+    monkeypatch.setattr(monitor, "log", lambda m: None)
+    html = '<input id="add-to-cart-button"><a id="sellerProfileTriggerId">Express Games</a>'
+    p = Product("B07K6RYVJ5", "Rs.4000")
+    assert monitor.fetch(FakeSession(FakeResp(200, html)), p)[0] is Status.OUT_OF_STOCK
+    other = html.replace("Express Games", "Appario Retail")
+    assert monitor.fetch(FakeSession(FakeResp(200, other)), p)[0] is Status.IN_STOCK
+    assert p.seller == "Appario Retail"
