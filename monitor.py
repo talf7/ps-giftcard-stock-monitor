@@ -3,6 +3,7 @@
 Round-robins over the products in products.txt and sends a Telegram message
 the moment any of them becomes available (and again if it goes out of stock).
 """
+import html as htmllib
 import os
 import random
 import re
@@ -100,6 +101,7 @@ def load_products(path: Path) -> list[Product]:
 
 
 TAG_RE = re.compile(r"<[^>]+>")
+PRIMARY_AVAILABILITY_RE = re.compile(r'primary-availability-message[^>]*>\s*([^<]+?)\s*<')
 
 
 def section_text(html: str, element_id: str, length: int = 3000, lower: bool = True) -> str | None:
@@ -139,6 +141,14 @@ def parse_status(html: str) -> Status:
     # No featured offer, but other sellers have it
     if 'id="buybox-see-all-buying-choices"' in lower:
         return Status.IN_STOCK
+    # The product's own availability line, e.g. "In stock" / "Currently unavailable."
+    m = PRIMARY_AVAILABILITY_RE.search(html)
+    if m:
+        text = m.group(1).lower()
+        if "unavailable" in text or "out of stock" in text:
+            return Status.OUT_OF_STOCK
+        if "in stock" in text:
+            return Status.IN_STOCK
     # Only trust the product's own availability box: "Currently unavailable"
     # also appears next to other denominations listed on the same page.
     availability = section_text(html, "availability", 600)
@@ -157,7 +167,9 @@ LOCATION_RE = re.compile(r'id="glow-ingress-line2"[^>]*>([^<]*)<')
 
 def parse_location(html: str) -> str | None:
     m = LOCATION_RE.search(html)
-    return " ".join(m.group(1).split()) or None if m else None
+    if not m:
+        return None
+    return " ".join(htmllib.unescape(m.group(1)).replace("\u200c", "").split()) or None
 
 
 # Only look for the price inside the product's own buy box; elsewhere on the

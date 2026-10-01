@@ -223,3 +223,29 @@ def test_pacer_slows_on_block_and_recovers(monkeypatch):
         clock[0] += monitor.Pacer.QUIET_PERIOD
         pacer.on_ok()
     assert pacer.interval == 1.5  # back to the fastest pace, never below
+
+
+# Trimmed from a real out-of-stock page (Rs.4000 card, Oct 2026)
+REAL_OOS = (
+    '<div id="availability" class="a-section a-spacing-base a-spacing-top-micro }">'
+    '<div id="all-offers-display" class="a-section">' + '<div class="a-spinner-wrapper"></div>' * 40 +
+    '<span class="a-declarative" data-action="show-all-offers-display"> '
+    '<span class="a-size-medium a-color-base primary-availability-message"> Currently unavailable. </span>'
+    '</span><br/>We don\'t know when or if this item will be back in stock.</div></div>'
+    # keyboard-shortcut markup that mentions the button without the button existing
+    '<span data-target="#add-to-cart-button" aria-label="Add to cart, shift, option, K"></span>'
+)
+
+
+def test_real_out_of_stock_page():
+    assert parse_status(REAL_OOS) is Status.OUT_OF_STOCK
+
+
+def test_primary_availability_in_stock():
+    html = REAL_OOS.replace("Currently unavailable.", "In stock")
+    assert parse_status(html) is Status.IN_STOCK
+
+
+def test_location_entities_removed():
+    html = '<span id="glow-ingress-line2">Mumbai 400001&zwnj;</span>'
+    assert monitor.parse_location(html) == "Mumbai 400001"
