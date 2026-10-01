@@ -14,6 +14,12 @@ from pathlib import Path
 
 import requests
 
+try:
+    # Mimics Chrome's TLS/HTTP2 fingerprint, which Amazon checks to spot scripts
+    from curl_cffi import requests as browser_requests
+except ImportError:  # pragma: no cover
+    browser_requests = None
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -32,9 +38,11 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(HERE / ".env")
 
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "1"))  # seconds between requests
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "2"))  # seconds between requests
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "60"))  # re-alert while in stock (s)
+BLOCK_ALERT_AFTER = float(os.getenv("BLOCK_ALERT_AFTER", "600"))  # warn if blocked this long (s)
+MAX_BACKOFF = 120
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -109,14 +117,23 @@ def parse_price(html: str) -> str | None:
     return None
 
 
-def fetch(session: requests.Session, product: Product) -> tuple[Status, str | None]:
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Cache-Control": "no-cache",
-    }
-    resp = session.get(product.url, headers=headers, timeout=10)
+def new_session():
+    """Fresh session that first visits the home page to pick up cookies like a browser."""
+    if browser_requests is not None:
+        session = browser_requests.Session(impersonate="chrome")
+    else:
+        session = requests.Session()
+        session.headers["User-Agent"] = random.choice(USER_AGENTS)
+    session.headers["Accept-Language"] = "en-IN,en;q=0.9"
+    try:
+        session.get("https://www.amazon.in/", timeout=10)
+    except Exception as e:
+        log(f"Home page warm-up failed: {e}")
+    return session
+
+
+def fetch(session, product: Product) -> tuple[Status, str | None]:
+    resp = session.get(product.url, timeout=10)
     if resp.status_code == 503:
         return Status.BLOCKED, None
     if resp.status_code != 200:
@@ -180,11 +197,15 @@ def main() -> int:
         log(f"No products in {PRODUCTS_FILE}")
         return 1
     keep_awake()
-    session = requests.Session()
+    session = new_session()
     start = round_start = time.monotonic()
-    rounds = blocks = 0
+    rounds = blocks = errors = 0
     backoff = 0.0
+    blocked_since = None
+    block_alerted = False
 
+    if browser_requests is None:
+        log("curl_cffi not installed - expect more blocks (pip install -r requirements.txt)")
     log(f"Monitoring {len(products)} products, one request every ~{INTERVAL}s")
     if os.getenv("STARTUP_MESSAGE", "1") == "1":
         names = "\n".join(f"• {p.label}" for p in products)
@@ -198,19 +219,35 @@ def main() -> int:
         product = products[i % len(products)]
         try:
             status, price = fetch(session, product)
-        except requests.RequestException as e:
+        except Exception as e:
             log(f"Request error ({product.label}): {e}")
             status, price = Status.UNKNOWN, None
+        if status is Status.UNKNOWN:
+            errors += 1
 
         if status is Status.BLOCKED:
             # Blocks are per IP, so pause everything and retry the same product
             blocks += 1
-            backoff = min(max(backoff * 2, 10), 300)
-            session = requests.Session()
+            now = time.monotonic()
+            blocked_since = blocked_since or now
+            if not block_alerted and now - blocked_since >= BLOCK_ALERT_AFTER:
+                block_alerted = send_telegram(
+                    f"⚠️ Amazon has been blocking the monitor for {(now - blocked_since) / 60:.0f} min - "
+                    f"stock is NOT being checked right now. Consider raising CHECK_INTERVAL "
+                    f"or restarting your router to get a new IP."
+                )
+            backoff = min(max(backoff * 2, 10), MAX_BACKOFF)
             log(f"Blocked by Amazon (captcha/503), backing off {backoff:.0f}s")
             time.sleep(backoff)
+            session = new_session()
             continue
         backoff = 0.0
+        if blocked_since is not None:
+            log(f"Unblocked after {(time.monotonic() - blocked_since) / 60:.1f} min")
+            if block_alerted:
+                send_telegram("✅ Monitor is no longer blocked - stock checks resumed.")
+            blocked_since = None
+            block_alerted = False
         i += 1
 
         now = time.monotonic()
@@ -223,10 +260,11 @@ def main() -> int:
             summary = f"IN STOCK: {', '.join(in_stock)}" if in_stock else "all out of stock"
             if unknown:
                 summary += f", {unknown} not readable"
+            notes = [f"{n} {what}" for n, what in ((blocks, "blocks"), (errors, "failed checks")) if n]
             log(f"Round {rounds} done in {now - round_start:.0f}s - {summary}"
-                + (f" ({blocks} blocks)" if blocks else ""))
+                + (f" ({', '.join(notes)})" if notes else ""))
             round_start = now
-            blocks = 0
+            blocks = errors = 0
 
         time.sleep(INTERVAL + random.uniform(0, INTERVAL * 0.3))
 
