@@ -184,12 +184,34 @@ def new_session():
         session.headers["User-Agent"] = random.choice(USER_AGENTS)
     session.headers["Accept-Language"] = "en-IN,en;q=0.9"
     try:
-        home = session.get("https://www.amazon.in/", timeout=10).text
-        if DELIVERY_PINCODE:
-            set_delivery_location(session, home, DELIVERY_PINCODE)
+        session.get("https://www.amazon.in/", timeout=10)
     except Exception as e:
         log(f"Home page warm-up failed: {e}")
     return session
+
+
+location_ok = False  # Amazon confirmed our delivery pincode
+last_location_try = float("-inf")
+
+
+def ensure_location(session) -> None:
+    """Set the delivery pincode once Amazon is answering normally (retried every 2 min).
+
+    Done lazily rather than on every new session: while Amazon shows a captcha
+    the home page has no token, and the extra requests only prolong the block.
+    """
+    global last_location_try
+    if not DELIVERY_PINCODE or location_ok or time.monotonic() - last_location_try < 120:
+        return
+    last_location_try = time.monotonic()
+    try:
+        resp = session.get("https://www.amazon.in/", timeout=10)
+        if resp.status_code == 503 or parse_status(resp.text) is Status.BLOCKED:
+            return  # try again later
+        if set_delivery_location(session, resp.text, DELIVERY_PINCODE):
+            log(f"Delivery pincode set to {DELIVERY_PINCODE}")
+    except Exception as e:
+        log(f"Could not set delivery pincode: {e}")
 
 
 CSRF_RES = [
@@ -263,12 +285,13 @@ def fetch(session, product: Product) -> tuple[Status, str | None]:
         problem = "page not found - listing may be removed" if resp.status_code == 404 else f"HTTP {resp.status_code}"
         report_problem(product, problem)
         return Status.UNKNOWN, None
-    global last_location
+    global last_location, location_ok
     save_page(product, resp.text)
     location = parse_location(resp.text)
     if location and location != last_location:
         log(f"Amazon delivery location: {location}")
         last_location = location
+    location_ok = bool(location and DELIVERY_PINCODE and DELIVERY_PINCODE in location)
     status = parse_status(resp.text)
     report_problem(product, "page not recognized, see debug folder" if status is Status.UNKNOWN else None)
     seller = parse_seller(resp.text) if status is Status.IN_STOCK else None
@@ -392,6 +415,7 @@ def handle_result(product: Product, status: Status, price: str | None, now: floa
 
 
 def main() -> int:
+    global location_ok
     products = load_products(PRODUCTS_FILE)
     if not products:
         log(f"No products in {PRODUCTS_FILE}")
@@ -444,6 +468,7 @@ def main() -> int:
             log(f"Blocked by Amazon (captcha/503), backing off {backoff:.0f}s")
             time.sleep(backoff)
             session = new_session()
+            location_ok = False  # new session, new cookies
             continue
         backoff = 0.0
         if blocked_since is not None:
@@ -456,6 +481,7 @@ def main() -> int:
 
         now = time.monotonic()
         handle_result(product, status, price, now)
+        ensure_location(session)
 
         if i % len(products) == 0:
             rounds += 1
