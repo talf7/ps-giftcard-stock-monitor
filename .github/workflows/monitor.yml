@@ -1,0 +1,33 @@
+name: Stock monitor
+
+on:
+  # Each run loops for ~5h50m; the schedule restarts it so coverage is continuous.
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    # Continuous monitoring needs ~43,000 Actions minutes/month, which is free
+    # only for public repos. On a private repo, scheduled runs are skipped so
+    # they don't burn your quota; manual runs still work.
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python monitor.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHECK_INTERVAL: ${{ vars.CHECK_INTERVAL || '2' }}
+          MAX_RUNTIME: "21000"
+          STARTUP_MESSAGE: "0"
