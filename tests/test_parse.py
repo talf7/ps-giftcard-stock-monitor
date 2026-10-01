@@ -74,3 +74,32 @@ def test_failed_send_retries(monkeypatch):
     p = Product("X", "X")
     monitor.handle_result(p, Status.IN_STOCK, None, 5)
     assert p.last_alert == 0.0  # will retry on next check
+
+
+class FakeResp:
+    def __init__(self, code, text=""):
+        self.status_code, self.text = code, text
+
+
+class FakeSession:
+    def __init__(self, resp):
+        self.resp = resp
+
+    def get(self, url, timeout):
+        return self.resp
+
+
+def test_fetch_reports_unrecognized_page_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(monitor, "DEBUG_DIR", tmp_path)
+    logs = []
+    monkeypatch.setattr(monitor, "log", logs.append)
+    p = Product("B000000001", "Card")
+    session = FakeSession(FakeResp(200, "<html>weird page</html>"))
+    assert monitor.fetch(session, p) == (Status.UNKNOWN, None)
+    monitor.fetch(session, p)
+    assert len(logs) == 1 and "Card" in logs[0]
+    assert (tmp_path / "B000000001.html").read_text() == "<html>weird page</html>"
+    # recovers, and a later problem is reported again
+    monitor.fetch(FakeSession(FakeResp(200, '<input id="add-to-cart-button">')), p)
+    monitor.fetch(FakeSession(FakeResp(404)), p)
+    assert len(logs) == 2 and "not found" in logs[1]

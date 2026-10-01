@@ -69,6 +69,7 @@ class Product:
     label: str
     status: Status | None = None
     last_alert: float = 0.0
+    last_problem: str | None = None
 
     @property
     def url(self) -> str:
@@ -132,13 +133,37 @@ def new_session():
     return session
 
 
+DEBUG_DIR = HERE / "debug"
+
+
+def report_problem(product: Product, problem: str | None, html: str = "") -> None:
+    """Log why a product couldn't be read (once per distinct problem) and keep the page."""
+    if problem == product.last_problem:
+        return
+    product.last_problem = problem
+    if problem is None:
+        return
+    log(f"{product.label}: could not read stock ({problem})")
+    if html:
+        try:
+            DEBUG_DIR.mkdir(exist_ok=True)
+            (DEBUG_DIR / f"{product.asin}.html").write_text(html, encoding="utf-8")
+        except OSError:
+            pass
+
+
 def fetch(session, product: Product) -> tuple[Status, str | None]:
     resp = session.get(product.url, timeout=10)
     if resp.status_code == 503:
         return Status.BLOCKED, None
     if resp.status_code != 200:
+        problem = "page not found - listing may be removed" if resp.status_code == 404 else f"HTTP {resp.status_code}"
+        report_problem(product, problem)
         return Status.UNKNOWN, None
-    return parse_status(resp.text), parse_price(resp.text)
+    status = parse_status(resp.text)
+    report_problem(product, "page not recognized, saved to debug folder" if status is Status.UNKNOWN else None,
+                   resp.text)
+    return status, parse_price(resp.text)
 
 
 def send_telegram(text: str) -> bool:
