@@ -433,32 +433,40 @@ def keep_awake() -> None:
 
 
 class Pacer:
-    """Adaptive request pace: slow down after a block, speed back up while unblocked.
+    """Adaptive request pace that learns how fast Amazon lets us go.
 
-    Amazon tolerates a different rate at different times, so instead of one fixed
-    interval this settles just under whatever it currently allows.
+    After a block it slows down 1.5x and remembers the pace that got blocked
+    (plus a 20% margin) as a floor. While unblocked it speeds back up, but only
+    down to that floor - so it doesn't keep running into the same limit. The
+    floor itself is lowered slowly (every hour without blocks) in case Amazon
+    has become more tolerant.
     """
 
     SLOWDOWN = 1.5  # interval multiplier per block episode
+    MARGIN = 1.2  # floor = blocked pace x this
     SPEEDUP = 0.9  # interval multiplier per quiet period
     QUIET_PERIOD = 300  # seconds without blocks before speeding up
+    FLOOR_DECAY_PERIOD = 3600  # seconds without blocks before lowering the floor
 
     def __init__(self, fastest: float, slowest: float):
         self.fastest, self.slowest = fastest, max(slowest, fastest)
-        self.interval = fastest
-        self.calm_since = time.monotonic()
+        self.interval = self.floor = fastest
+        self.calm_since = self.floor_calm_since = time.monotonic()
 
     def on_block(self) -> None:
-        new = min(self.interval * self.SLOWDOWN, self.slowest)
-        if new != self.interval:
-            log(f"Slowing down to one request every {new:.1f}s")
-        self.interval = new
-        self.calm_since = time.monotonic()
+        self.floor = min(self.slowest, max(self.floor, self.interval * self.MARGIN))
+        self.interval = min(self.slowest, max(self.interval * self.SLOWDOWN, self.floor))
+        log(f"Slowing down to one request every {self.interval:.1f}s "
+            f"(won't go faster than {self.floor:.1f}s for now)")
+        self.calm_since = self.floor_calm_since = time.monotonic()
 
     def on_ok(self) -> None:
         now = time.monotonic()
-        if self.interval > self.fastest and now - self.calm_since >= self.QUIET_PERIOD:
-            self.interval = max(self.fastest, self.interval * self.SPEEDUP)
+        if self.floor > self.fastest and now - self.floor_calm_since >= self.FLOOR_DECAY_PERIOD:
+            self.floor = max(self.fastest, self.floor * self.SPEEDUP)
+            self.floor_calm_since = now
+        if self.interval > self.floor and now - self.calm_since >= self.QUIET_PERIOD:
+            self.interval = max(self.floor, self.interval * self.SPEEDUP)
             self.calm_since = now
             log(f"No blocks for {self.QUIET_PERIOD // 60} min - speeding up to every {self.interval:.1f}s")
 

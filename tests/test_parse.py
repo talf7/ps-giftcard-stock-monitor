@@ -207,22 +207,26 @@ def test_unmute_button(monkeypatch):
     assert not p.muted
 
 
-def test_pacer_slows_on_block_and_recovers(monkeypatch):
+def test_pacer_learns_floor(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(monitor.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(monitor, "log", lambda m: None)
     pacer = monitor.Pacer(1.5, 8)
-    pacer.on_block()
-    assert pacer.interval == 2.25
+    pacer.on_block()  # blocked at 1.5s
+    assert pacer.interval == 2.25 and pacer.floor == 1.5 * 1.2
     for _ in range(10):
-        pacer.on_block()
-    assert pacer.interval == 8  # capped
-    pacer.on_ok()
-    assert pacer.interval == 8  # not quiet long enough yet
-    for _ in range(40):
         clock[0] += monitor.Pacer.QUIET_PERIOD
         pacer.on_ok()
-    assert pacer.interval == 1.5  # back to the fastest pace, never below
+    # sped back up, but not into the pace that got blocked
+    assert pacer.interval == pacer.floor == 1.8
+    for _ in range(10):
+        pacer.on_block()
+    assert pacer.interval == pacer.floor == 8  # capped
+    # many quiet hours: floor and pace drift back to the fastest allowed
+    for _ in range(12 * 30):
+        clock[0] += monitor.Pacer.QUIET_PERIOD
+        pacer.on_ok()
+    assert pacer.interval == pacer.floor == 1.5
 
 
 # Trimmed from a real out-of-stock page (Rs.4000 card, Oct 2026)
