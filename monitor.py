@@ -181,12 +181,11 @@ def main() -> int:
         return 1
     keep_awake()
     session = requests.Session()
-    start = last_summary = time.monotonic()
-    checks = blocks = 0
+    start = round_start = time.monotonic()
+    rounds = blocks = 0
     backoff = 0.0
 
-    log(f"Monitoring {len(products)} products, one request every {INTERVAL}s "
-        f"(each product every ~{INTERVAL * len(products):.0f}s)")
+    log(f"Monitoring {len(products)} products, one request every ~{INTERVAL}s")
     if os.getenv("STARTUP_MESSAGE", "1") == "1":
         names = "\n".join(f"• {p.label}" for p in products)
         send_telegram(f"👀 Stock monitor started, watching {len(products)} products:\n{names}")
@@ -202,7 +201,6 @@ def main() -> int:
         except requests.RequestException as e:
             log(f"Request error ({product.label}): {e}")
             status, price = Status.UNKNOWN, None
-        checks += 1
 
         if status is Status.BLOCKED:
             # Blocks are per IP, so pause everything and retry the same product
@@ -218,12 +216,17 @@ def main() -> int:
         now = time.monotonic()
         handle_result(product, status, price, now)
 
-        if now - last_summary >= 600:
+        if i % len(products) == 0:
+            rounds += 1
             in_stock = [p.label for p in products if p.status is Status.IN_STOCK]
-            log(f"Alive: {checks} checks, {blocks} blocks in last 10 min; "
-                f"in stock: {', '.join(in_stock) or 'none'}")
-            checks = blocks = 0
-            last_summary = now
+            unknown = sum(p.status is None for p in products)
+            summary = f"IN STOCK: {', '.join(in_stock)}" if in_stock else "all out of stock"
+            if unknown:
+                summary += f", {unknown} not readable"
+            log(f"Round {rounds} done in {now - round_start:.0f}s - {summary}"
+                + (f" ({blocks} blocks)" if blocks else ""))
+            round_start = now
+            blocks = 0
 
         time.sleep(INTERVAL + random.uniform(0, INTERVAL * 0.3))
 
