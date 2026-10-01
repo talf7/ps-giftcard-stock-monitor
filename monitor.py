@@ -43,6 +43,8 @@ MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "60"))  # re-alert while in stock (s)
 BLOCK_ALERT_AFTER = float(os.getenv("BLOCK_ALERT_AFTER", "600"))  # warn if blocked this long (s)
 MAX_BACKOFF = 120
+# Amazon shows stock for a delivery location; without an Indian pincode it may hide offers
+DELIVERY_PINCODE = os.getenv("DELIVERY_PINCODE", "400001")  # Mumbai
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -91,15 +93,46 @@ def load_products(path: Path) -> list[Product]:
     return products
 
 
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+def section_text(html: str, element_id: str, length: int = 3000) -> str | None:
+    """Visible text right after the element with this id (lowercased), or None."""
+    start = html.find(f'id="{element_id}"')
+    if start == -1:
+        return None
+    start = html.find(">", start) + 1
+    return " ".join(TAG_RE.sub(" ", html[start:start + length]).split()).lower()
+
+
 def parse_status(html: str) -> Status:
     lower = html.lower()
     if "validatecaptcha" in lower or "enter the characters you see below" in lower:
         return Status.BLOCKED
     if 'id="add-to-cart-button"' in lower or 'id="buy-now-button"' in lower:
         return Status.IN_STOCK
-    if "currently unavailable" in lower or 'id="outofstock"' in lower:
+    # No featured offer, but other sellers have it
+    if 'id="buybox-see-all-buying-choices"' in lower:
+        return Status.IN_STOCK
+    # Only trust the product's own availability box: "Currently unavailable"
+    # also appears next to other denominations listed on the same page.
+    availability = section_text(html, "availability", 600)
+    if availability:
+        if "unavailable" in availability or "out of stock" in availability:
+            return Status.OUT_OF_STOCK
+        if "in stock" in availability:
+            return Status.IN_STOCK
+    if 'id="outofstock"' in lower:
         return Status.OUT_OF_STOCK
     return Status.UNKNOWN
+
+
+LOCATION_RE = re.compile(r'id="glow-ingress-line2"[^>]*>([^<]*)<')
+
+
+def parse_location(html: str) -> str | None:
+    m = LOCATION_RE.search(html)
+    return " ".join(m.group(1).split()) or None if m else None
 
 
 # Only look for the price inside the product's own buy box; elsewhere on the
@@ -127,29 +160,75 @@ def new_session():
         session.headers["User-Agent"] = random.choice(USER_AGENTS)
     session.headers["Accept-Language"] = "en-IN,en;q=0.9"
     try:
-        session.get("https://www.amazon.in/", timeout=10)
+        home = session.get("https://www.amazon.in/", timeout=10).text
+        if DELIVERY_PINCODE:
+            set_delivery_location(session, home, DELIVERY_PINCODE)
     except Exception as e:
         log(f"Home page warm-up failed: {e}")
     return session
 
 
+CSRF_RES = [
+    re.compile(r'anti-csrftoken-a2z&quot;:&quot;([^&]+)&quot;'),
+    re.compile(r'"anti-csrftoken-a2z"\s*:\s*"([^"]+)"'),
+    re.compile(r'CSRF_TOKEN\s*:\s*"([^"]+)"'),
+]
+
+
+def find_csrf(html: str) -> str | None:
+    for regex in CSRF_RES:
+        m = regex.search(html)
+        if m:
+            return m.group(1)
+    return None
+
+
+def set_delivery_location(session, home_html: str, pincode: str) -> bool:
+    """Set the delivery pincode the same way the "Deliver to" popup on amazon.in does."""
+    token = find_csrf(home_html)
+    if not token:
+        log("Could not set delivery pincode (no token on home page)")
+        return False
+    modal = session.get(
+        "https://www.amazon.in/portal-migration/hz/glow/get-rendered-address-selections"
+        "?deviceType=desktop&pageType=Gateway&storeContext=NoStoreName&actionSource=desktop-modal",
+        headers={"anti-csrftoken-a2z": token}, timeout=10,
+    ).text
+    token = find_csrf(modal) or token
+    resp = session.post(
+        "https://www.amazon.in/portal-migration/hz/glow/address-change?actionSource=glow",
+        json={"locationType": "LOCATION_INPUT", "zipCode": pincode, "storeContext": "generic",
+              "deviceType": "web", "pageType": "Gateway", "actionSource": "glow"},
+        headers={"anti-csrftoken-a2z": token, "Content-Type": "application/json"}, timeout=10,
+    )
+    ok = resp.status_code == 200 and '"isAddressUpdated":1' in resp.text.replace(" ", "")
+    if not ok:
+        log(f"Could not set delivery pincode {pincode} (HTTP {resp.status_code})")
+    return ok
+
+
 DEBUG_DIR = HERE / "debug"
 
 
-def report_problem(product: Product, problem: str | None, html: str = "") -> None:
-    """Log why a product couldn't be read (once per distinct problem) and keep the page."""
+last_location = None
+
+
+def save_page(product: Product, html: str) -> None:
+    """Keep the latest page per product in debug/ so detection can be checked by eye."""
+    try:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        (DEBUG_DIR / f"{product.asin}.html").write_text(html, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def report_problem(product: Product, problem: str | None) -> None:
+    """Log why a product couldn't be read, once per distinct problem."""
     if problem == product.last_problem:
         return
     product.last_problem = problem
-    if problem is None:
-        return
-    log(f"{product.label}: could not read stock ({problem})")
-    if html:
-        try:
-            DEBUG_DIR.mkdir(exist_ok=True)
-            (DEBUG_DIR / f"{product.asin}.html").write_text(html, encoding="utf-8")
-        except OSError:
-            pass
+    if problem is not None:
+        log(f"{product.label}: could not read stock ({problem})")
 
 
 def fetch(session, product: Product) -> tuple[Status, str | None]:
@@ -160,9 +239,14 @@ def fetch(session, product: Product) -> tuple[Status, str | None]:
         problem = "page not found - listing may be removed" if resp.status_code == 404 else f"HTTP {resp.status_code}"
         report_problem(product, problem)
         return Status.UNKNOWN, None
+    global last_location
+    save_page(product, resp.text)
+    location = parse_location(resp.text)
+    if location and location != last_location:
+        log(f"Amazon delivery location: {location}")
+        last_location = location
     status = parse_status(resp.text)
-    report_problem(product, "page not recognized, saved to debug folder" if status is Status.UNKNOWN else None,
-                   resp.text)
+    report_problem(product, "page not recognized, see debug folder" if status is Status.UNKNOWN else None)
     return status, parse_price(resp.text)
 
 

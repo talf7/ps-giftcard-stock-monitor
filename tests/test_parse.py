@@ -103,3 +103,40 @@ def test_fetch_reports_unrecognized_page_once(monkeypatch, tmp_path):
     monitor.fetch(FakeSession(FakeResp(200, '<input id="add-to-cart-button">')), p)
     monitor.fetch(FakeSession(FakeResp(404)), p)
     assert len(logs) == 2 and "not found" in logs[1]
+
+
+SWATCHES = (
+    '<div id="variation_style_name"><li>Rs.2000 <span>Currently unavailable.</span></li>'
+    '<li>Rs.4000</li></div>'
+)
+
+
+def test_in_stock_ignores_other_denominations_unavailable():
+    html = SWATCHES + '<div id="availability"><span class="a-color-success"> In stock </span></div>'
+    assert parse_status(html) is Status.IN_STOCK
+
+
+def test_out_of_stock_from_availability_box():
+    html = SWATCHES + '<div id="availability"><span>Currently unavailable.</span></div>'
+    assert parse_status(html) is Status.OUT_OF_STOCK
+
+
+def test_swatch_text_alone_is_not_out_of_stock():
+    assert parse_status(SWATCHES) is Status.UNKNOWN
+
+
+def test_other_sellers_count_as_in_stock():
+    html = '<div id="availability">Currently unavailable</div><a id="buybox-see-all-buying-choices">See All Buying Options</a>'
+    assert parse_status(html) is Status.IN_STOCK
+
+
+def test_parse_location():
+    html = '<span class="nav-line-2" id="glow-ingress-line2">\n  Mumbai 400001‌  </span>'
+    assert monitor.parse_location(html).startswith("Mumbai 400001")
+    assert monitor.parse_location("<html></html>") is None
+
+
+def test_find_csrf():
+    assert monitor.find_csrf('data-a-modal="{&quot;anti-csrftoken-a2z&quot;:&quot;abc123&quot;}"') == "abc123"
+    assert monitor.find_csrf('CSRF_TOKEN : "xyz",') == "xyz"
+    assert monitor.find_csrf("nothing") is None
