@@ -39,7 +39,8 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(HERE / ".env")
 
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "1.5"))  # seconds between request starts
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "1.5"))  # fastest pace: seconds between request starts
+MAX_INTERVAL = float(os.getenv("MAX_CHECK_INTERVAL", "8"))  # slowest pace after repeated blocks
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "300"))  # re-alert while in stock (s)
 BLOCK_ALERT_AFTER = float(os.getenv("BLOCK_ALERT_AFTER", "600"))  # warn if blocked this long (s)
@@ -419,6 +420,37 @@ def keep_awake() -> None:
             kernel32.SetConsoleMode(stdin, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
 
 
+class Pacer:
+    """Adaptive request pace: slow down after a block, speed back up while unblocked.
+
+    Amazon tolerates a different rate at different times, so instead of one fixed
+    interval this settles just under whatever it currently allows.
+    """
+
+    SLOWDOWN = 1.5  # interval multiplier per block episode
+    SPEEDUP = 0.9  # interval multiplier per quiet period
+    QUIET_PERIOD = 300  # seconds without blocks before speeding up
+
+    def __init__(self, fastest: float, slowest: float):
+        self.fastest, self.slowest = fastest, max(slowest, fastest)
+        self.interval = fastest
+        self.calm_since = time.monotonic()
+
+    def on_block(self) -> None:
+        new = min(self.interval * self.SLOWDOWN, self.slowest)
+        if new != self.interval:
+            log(f"Slowing down to one request every {new:.1f}s")
+        self.interval = new
+        self.calm_since = time.monotonic()
+
+    def on_ok(self) -> None:
+        now = time.monotonic()
+        if self.interval > self.fastest and now - self.calm_since >= self.QUIET_PERIOD:
+            self.interval = max(self.fastest, self.interval * self.SPEEDUP)
+            self.calm_since = now
+            log(f"No blocks for {self.QUIET_PERIOD // 60} min - speeding up to every {self.interval:.1f}s")
+
+
 def handle_result(product: Product, status: Status, price: str | None, now: float) -> None:
     price_txt = f" — ₹{price}" if price else ""
     if status is Status.IN_STOCK:
@@ -457,12 +489,14 @@ def main() -> int:
     start = round_start = time.monotonic()
     rounds = blocks = errors = 0
     backoff = 0.0
+    pacer = Pacer(INTERVAL, MAX_INTERVAL)
     blocked_since = None
     block_alerted = False
 
     if browser_requests is None:
         log("curl_cffi not installed - expect more blocks (pip install -r requirements.txt)")
-    log(f"Monitoring {len(products)} products, one request every ~{INTERVAL}s")
+    log(f"Monitoring {len(products)} products, one request every ~{INTERVAL}s "
+        f"(slows down to {MAX_INTERVAL}s automatically if Amazon blocks)")
     if os.getenv("STARTUP_MESSAGE", "1") == "1":
         names = "\n".join(f"• {p.label}" for p in products)
         send_telegram(f"👀 Stock monitor started, watching {len(products)} products:\n{names}")
@@ -490,9 +524,11 @@ def main() -> int:
             if not block_alerted and now - blocked_since >= BLOCK_ALERT_AFTER:
                 block_alerted = send_telegram(
                     f"⚠️ Amazon has been blocking the monitor for {(now - blocked_since) / 60:.0f} min - "
-                    f"stock is NOT being checked right now. Consider raising CHECK_INTERVAL "
-                    f"or restarting your router to get a new IP."
+                    f"stock is NOT being checked right now. It retries every 2 min and has slowed "
+                    f"down automatically; restarting the router (new IP) clears it faster."
                 )
+            if backoff == 0:
+                pacer.on_block()  # once per block episode, not per retry
             backoff = min(max(backoff * 2, 10), MAX_BACKOFF)
             log(f"Blocked by Amazon (captcha/503), backing off {backoff:.0f}s")
             time.sleep(backoff)
@@ -500,6 +536,7 @@ def main() -> int:
             location_ok = False  # new session, new cookies
             continue
         backoff = 0.0
+        pacer.on_ok()
         if blocked_since is not None:
             log(f"Unblocked after {(time.monotonic() - blocked_since) / 60:.1f} min")
             if block_alerted:
@@ -521,6 +558,8 @@ def main() -> int:
             if unknown:
                 summary += f", {unknown} not readable"
             notes = [f"{n} {what}" for n, what in ((blocks, "blocks"), (errors, "failed checks")) if n]
+            if pacer.interval > pacer.fastest:
+                notes.append(f"pace {pacer.interval:.1f}s")
             log(f"Round {rounds} done in {now - round_start:.0f}s - {summary}"
                 + (f" ({', '.join(notes)})" if notes else ""))
             round_start = now
@@ -528,7 +567,7 @@ def main() -> int:
 
         # Pace from the start of the request, so slow responses don't add extra delay
         elapsed = time.monotonic() - request_start
-        time.sleep(max(0.0, INTERVAL - elapsed) + random.uniform(0, 0.4))
+        time.sleep(max(0.0, pacer.interval - elapsed) + random.uniform(0, 0.4))
 
 
 if __name__ == "__main__":
