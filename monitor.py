@@ -1,19 +1,38 @@
 """Amazon.in stock monitor with Telegram alerts.
 
-Polls an Amazon product page and sends a Telegram message the moment the
-item becomes available (and again if it goes out of stock).
+Round-robins over the products in products.txt and sends a Telegram message
+the moment any of them becomes available (and again if it goes out of stock).
 """
 import os
 import random
+import re
 import sys
 import time
+from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 import requests
 
-ASIN = os.getenv("ASIN", "B093QF35KZ")  # Rs.2000 PlayStation Store Gift Card
-PRODUCT_URL = f"https://www.amazon.in/dp/{ASIN}"
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "1"))  # seconds between checks
+HERE = Path(__file__).resolve().parent
+
+
+def load_dotenv(path: Path) -> None:
+    """Minimal .env loader so running locally needs no extra setup."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_dotenv(HERE / ".env")
+
+PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "1"))  # seconds between requests
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "60"))  # re-alert while in stock (s)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -26,12 +45,41 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
 ]
 
+PRICE_RE = re.compile(r'class="a-price-whole">\s*([\d,]+)')
+
 
 class Status(Enum):
     IN_STOCK = "in_stock"
     OUT_OF_STOCK = "out_of_stock"
     BLOCKED = "blocked"  # captcha / robot check
     UNKNOWN = "unknown"
+
+
+@dataclass
+class Product:
+    asin: str
+    label: str
+    status: Status | None = None
+    last_alert: float = 0.0
+
+    @property
+    def url(self) -> str:
+        return f"https://www.amazon.in/dp/{self.asin}"
+
+    @property
+    def cart_url(self) -> str:
+        return f"https://www.amazon.in/gp/aws/cart/add.html?ASIN.1={self.asin}&Quantity.1=1"
+
+
+def load_products(path: Path) -> list[Product]:
+    products = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        asin, _, label = line.partition("|")
+        products.append(Product(asin.strip(), label.strip() or asin.strip()))
+    return products
 
 
 def parse_status(html: str) -> Status:
@@ -45,86 +93,132 @@ def parse_status(html: str) -> Status:
     return Status.UNKNOWN
 
 
-def fetch_status(session: requests.Session) -> Status:
+def parse_price(html: str) -> str | None:
+    m = PRICE_RE.search(html)
+    return m.group(1) if m else None
+
+
+def fetch(session: requests.Session, product: Product) -> tuple[Status, str | None]:
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
         "Cache-Control": "no-cache",
     }
-    resp = session.get(PRODUCT_URL, headers=headers, timeout=10)
+    resp = session.get(product.url, headers=headers, timeout=10)
     if resp.status_code == 503:
-        return Status.BLOCKED
+        return Status.BLOCKED, None
     if resp.status_code != 200:
-        return Status.UNKNOWN
-    return parse_status(resp.text)
+        return Status.UNKNOWN, None
+    return parse_status(resp.text), parse_price(resp.text)
 
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[telegram not configured] {text}", flush=True)
-        return
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
             timeout=10,
         )
         if not r.ok:
             print(f"Telegram error {r.status_code}: {r.text}", flush=True)
+        return r.ok
     except requests.RequestException as e:
         print(f"Telegram request failed: {e}", flush=True)
+        return False
 
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
+def keep_awake() -> None:
+    """On Windows, stop the PC from sleeping while the monitor runs."""
+    if sys.platform == "win32":
+        import ctypes
+
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+
+def handle_result(product: Product, status: Status, price: str | None, now: float) -> None:
+    price_txt = f" — ₹{price}" if price else ""
+    if status is Status.IN_STOCK:
+        if product.status is not Status.IN_STOCK or now - product.last_alert >= REMIND_EVERY:
+            sent = send_telegram(
+                f"🟢 IN STOCK: {product.label}{price_txt}\n\n"
+                f"🛒 Add to cart: {product.cart_url}\n"
+                f"📄 Page: {product.url}"
+            )
+            if sent:
+                product.last_alert = now
+    elif status is Status.OUT_OF_STOCK and product.status is Status.IN_STOCK:
+        send_telegram(f"🔴 Out of stock again: {product.label}\n{product.url}")
+
+    if status is not product.status and status is not Status.UNKNOWN:
+        log(f"{product.label}: {status.value}{price_txt}")
+        product.status = status
+
+
 def main() -> int:
+    products = load_products(PRODUCTS_FILE)
+    if not products:
+        log(f"No products in {PRODUCTS_FILE}")
+        return 1
+    keep_awake()
     session = requests.Session()
-    start = time.monotonic()
-    last_status = None
-    last_alert = 0.0
+    start = last_summary = time.monotonic()
+    checks = blocks = 0
     backoff = 0.0
 
-    log(f"Monitoring {PRODUCT_URL} every {INTERVAL}s")
+    log(f"Monitoring {len(products)} products, one request every {INTERVAL}s "
+        f"(each product every ~{INTERVAL * len(products):.0f}s)")
     if os.getenv("STARTUP_MESSAGE", "1") == "1":
-        send_telegram(f"👀 Stock monitor started for {PRODUCT_URL}")
+        names = "\n".join(f"• {p.label}" for p in products)
+        send_telegram(f"👀 Stock monitor started, watching {len(products)} products:\n{names}")
 
+    i = 0
     while True:
         if MAX_RUNTIME and time.monotonic() - start > MAX_RUNTIME:
             log("Max runtime reached, exiting")
             return 0
+        product = products[i % len(products)]
         try:
-            status = fetch_status(session)
+            status, price = fetch(session, product)
         except requests.RequestException as e:
-            log(f"Request error: {e}")
-            status = Status.UNKNOWN
+            log(f"Request error ({product.label}): {e}")
+            status, price = Status.UNKNOWN, None
+        checks += 1
 
         if status is Status.BLOCKED:
-            # Amazon rate-limited us: back off exponentially (max 5 min)
+            # Blocks are per IP, so pause everything and retry the same product
+            blocks += 1
             backoff = min(max(backoff * 2, 10), 300)
             session = requests.Session()
             log(f"Blocked by Amazon (captcha/503), backing off {backoff:.0f}s")
             time.sleep(backoff)
             continue
         backoff = 0.0
+        i += 1
 
         now = time.monotonic()
-        if status is Status.IN_STOCK:
-            if last_status is not Status.IN_STOCK or now - last_alert >= REMIND_EVERY:
-                send_telegram(f"🟢 IN STOCK! PlayStation gift card is available:\n{PRODUCT_URL}")
-                last_alert = now
-        elif status is Status.OUT_OF_STOCK and last_status is Status.IN_STOCK:
-            send_telegram(f"🔴 Out of stock again:\n{PRODUCT_URL}")
+        handle_result(product, status, price, now)
 
-        if status is not last_status:
-            log(f"Status: {status.value}")
-        if status is not Status.UNKNOWN:
-            last_status = status
+        if now - last_summary >= 600:
+            in_stock = [p.label for p in products if p.status is Status.IN_STOCK]
+            log(f"Alive: {checks} checks, {blocks} blocks in last 10 min; "
+                f"in stock: {', '.join(in_stock) or 'none'}")
+            checks = blocks = 0
+            last_summary = now
 
         time.sleep(INTERVAL + random.uniform(0, INTERVAL * 0.3))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("Stopped")
