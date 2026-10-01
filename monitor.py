@@ -4,6 +4,7 @@ Round-robins over the products in products.txt and sends a Telegram message
 the moment any of them becomes available (and again if it goes out of stock).
 """
 import html as htmllib
+import json
 import os
 import random
 import re
@@ -40,7 +41,7 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(HERE / ".env")
 
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "1.5"))  # fastest pace: seconds between request starts
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "3"))  # fastest pace: seconds between request starts
 MAX_INTERVAL = float(os.getenv("MAX_CHECK_INTERVAL", "8"))  # slowest pace after repeated blocks
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "300"))  # re-alert while in stock (s)
@@ -442,16 +443,40 @@ class Pacer:
     has become more tolerant.
     """
 
-    SLOWDOWN = 1.5  # interval multiplier per block episode
-    MARGIN = 1.2  # floor = blocked pace x this
+    SLOWDOWN = 2  # interval multiplier per block episode
+    MARGIN = 1.3  # floor = blocked pace x this
+    STATE_FILE = HERE / "pace_state.json"  # remembers the floor across restarts
+    STATE_MAX_AGE = 6 * 3600
     SPEEDUP = 0.9  # interval multiplier per quiet period
     QUIET_PERIOD = 300  # seconds without blocks before speeding up
     FLOOR_DECAY_PERIOD = 3600  # seconds without blocks before lowering the floor
 
-    def __init__(self, fastest: float, slowest: float):
+    def __init__(self, fastest: float, slowest: float, remember: bool = False):
         self.fastest, self.slowest = fastest, max(slowest, fastest)
+        self.remember = remember
         self.interval = self.floor = fastest
         self.calm_since = self.floor_calm_since = time.monotonic()
+        if remember:
+            self._load()
+
+    def _load(self) -> None:
+        """Start from the floor learned before a restart, if it is recent."""
+        try:
+            state = json.loads(self.STATE_FILE.read_text())
+            if time.time() - state["saved_at"] < self.STATE_MAX_AGE:
+                self.interval = self.floor = min(self.slowest, max(self.fastest, float(state["floor"])))
+                if self.floor > self.fastest:
+                    log(f"Starting at the pace learned before restart: every {self.floor:.1f}s")
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def _save(self) -> None:
+        if not self.remember:
+            return
+        try:
+            self.STATE_FILE.write_text(json.dumps({"floor": self.floor, "saved_at": time.time()}))
+        except OSError:
+            pass
 
     def on_block(self) -> None:
         self.floor = min(self.slowest, max(self.floor, self.interval * self.MARGIN))
@@ -459,12 +484,14 @@ class Pacer:
         log(f"Slowing down to one request every {self.interval:.1f}s "
             f"(won't go faster than {self.floor:.1f}s for now)")
         self.calm_since = self.floor_calm_since = time.monotonic()
+        self._save()
 
     def on_ok(self) -> None:
         now = time.monotonic()
         if self.floor > self.fastest and now - self.floor_calm_since >= self.FLOOR_DECAY_PERIOD:
             self.floor = max(self.fastest, self.floor * self.SPEEDUP)
             self.floor_calm_since = now
+            self._save()
         if self.interval > self.floor and now - self.calm_since >= self.QUIET_PERIOD:
             self.interval = max(self.floor, self.interval * self.SPEEDUP)
             self.calm_since = now
@@ -509,7 +536,7 @@ def main() -> int:
     start = round_start = time.monotonic()
     rounds = blocks = errors = 0
     backoff = 0.0
-    pacer = Pacer(INTERVAL, MAX_INTERVAL)
+    pacer = Pacer(INTERVAL, MAX_INTERVAL, remember=True)
     blocked_since = None
     block_alerted = False
 

@@ -215,12 +215,12 @@ def test_pacer_learns_floor(monkeypatch):
     monkeypatch.setattr(monitor, "log", lambda m: None)
     pacer = monitor.Pacer(1.5, 8)
     pacer.on_block()  # blocked at 1.5s
-    assert pacer.interval == 2.25 and pacer.floor == pytest.approx(1.8)
+    assert pacer.interval == 3.0 and pacer.floor == pytest.approx(1.95)
     for _ in range(10):
         clock[0] += monitor.Pacer.QUIET_PERIOD
         pacer.on_ok()
     # sped back up, but not into the pace that got blocked
-    assert pacer.interval == pacer.floor == pytest.approx(1.8)
+    assert pacer.interval == pacer.floor == pytest.approx(1.95)
     for _ in range(10):
         pacer.on_block()
     assert pacer.interval == pacer.floor == 8  # capped
@@ -255,3 +255,16 @@ def test_primary_availability_in_stock():
 def test_location_entities_removed():
     html = '<span id="glow-ingress-line2">Mumbai 400001&zwnj;</span>'
     assert monitor.parse_location(html) == "Mumbai 400001"
+
+
+def test_pacer_remembers_floor_across_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(monitor.Pacer, "STATE_FILE", tmp_path / "pace.json")
+    monkeypatch.setattr(monitor, "log", lambda m: None)
+    first = monitor.Pacer(3, 8, remember=True)
+    first.on_block()
+    assert first.floor == pytest.approx(3.9)
+    restarted = monitor.Pacer(3, 8, remember=True)
+    assert restarted.interval == restarted.floor == pytest.approx(3.9)
+    # stale state is ignored
+    monkeypatch.setattr(monitor.Pacer, "STATE_MAX_AGE", -1)
+    assert monitor.Pacer(3, 8, remember=True).floor == 3
