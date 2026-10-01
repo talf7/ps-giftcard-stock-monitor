@@ -1,3 +1,5 @@
+import pytest
+
 import monitor
 from monitor import Product, Status, load_products, parse_price, parse_status
 
@@ -213,12 +215,12 @@ def test_pacer_learns_floor(monkeypatch):
     monkeypatch.setattr(monitor, "log", lambda m: None)
     pacer = monitor.Pacer(1.5, 8)
     pacer.on_block()  # blocked at 1.5s
-    assert pacer.interval == 2.25 and pacer.floor == 1.5 * 1.2
+    assert pacer.interval == 2.25 and pacer.floor == pytest.approx(1.8)
     for _ in range(10):
         clock[0] += monitor.Pacer.QUIET_PERIOD
         pacer.on_ok()
     # sped back up, but not into the pace that got blocked
-    assert pacer.interval == pacer.floor == 1.8
+    assert pacer.interval == pacer.floor == pytest.approx(1.8)
     for _ in range(10):
         pacer.on_block()
     assert pacer.interval == pacer.floor == 8  # capped
