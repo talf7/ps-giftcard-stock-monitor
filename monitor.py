@@ -41,7 +41,7 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(HERE / ".env")
 
 PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", HERE / "products.txt"))
-INTERVAL = float(os.getenv("CHECK_INTERVAL", "3"))  # fastest pace: seconds between request starts
+INTERVAL = float(os.getenv("CHECK_INTERVAL", "5"))  # fastest pace: seconds between request starts
 MAX_INTERVAL = float(os.getenv("MAX_CHECK_INTERVAL", "8"))  # slowest pace after repeated blocks
 MAX_RUNTIME = float(os.getenv("MAX_RUNTIME", "0"))  # 0 = run forever
 REMIND_EVERY = float(os.getenv("REMIND_EVERY", "300"))  # re-alert while in stock (s)

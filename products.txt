@@ -2,17 +2,17 @@
 # Format: ASIN | label    (put # at the start of a line to stop tracking it)
 
 # Sold by Amazon - "Email Delivery in 1 hour"
-B07K6RYVHR | Rs.1000 PS Gift Card
+# B07K6RYVHR | Rs.1000 PS Gift Card
 B093QF35KZ | Rs.2000 PS Gift Card
-B07K6PVR8B | Rs.3000 PS Gift Card
+# B07K6PVR8B | Rs.3000 PS Gift Card
 B07K6RYVJ5 | Rs.4000 PS Gift Card
-B0CYPG8RYH | Rs.7000 PS Gift Card
-B0CYP5X177 | Rs.8000 PS Gift Card
-B0CYNZJLBC | Rs.9000 PS Gift Card
+# B0CYPG8RYH | Rs.7000 PS Gift Card
+# B0CYP5X177 | Rs.8000 PS Gift Card
+# B0CYNZJLBC | Rs.9000 PS Gift Card
 
 # "Code Only - Smart Delivery" (third-party sellers, often above face value)
-B0DZPB9L3R | INR 1000 PS Gift Card (Smart Delivery)
-B0DZP8ZSHW | INR 2000 PS Gift Card (Smart Delivery)
-B0DZP97TKP | INR 3000 PS Gift Card (Smart Delivery)
-B0DZP789PS | INR 4000 PS Gift Card (Smart Delivery)
-B0DZP9P3HH | INR 5000 PS Gift Card (Smart Delivery)
+# B0DZPB9L3R | INR 1000 PS Gift Card (Smart Delivery)
+# B0DZP8ZSHW | INR 2000 PS Gift Card (Smart Delivery)
+# B0DZP97TKP | INR 3000 PS Gift Card (Smart Delivery)
+# B0DZP789PS | INR 4000 PS Gift Card (Smart Delivery)
+# B0DZP9P3HH | INR 5000 PS Gift Card (Smart Delivery)
