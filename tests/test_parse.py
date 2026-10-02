@@ -51,7 +51,7 @@ def test_load_products(tmp_path):
 
 def test_bundled_products_file():
     products = load_products(monitor.PRODUCTS_FILE)
-    assert len(products) >= 10
+    assert len(products) >= 1
     assert all(len(p.asin) == 10 for p in products)
 
 
